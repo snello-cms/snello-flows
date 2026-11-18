@@ -1,0 +1,34 @@
+document:
+  dsl: "1.0.0"
+  namespace: explore
+  name: kayak-stats
+  version: "1.0.0"
+  title: Kayak stats
+  summary: >-
+    Feature: call http + set with jq. Reads every kayak (public GET) and aggregates it in one jq step.
+    No input.
+use:
+  secrets:
+    - snello
+do:
+  - fetchKayaks:
+      call: http
+      with:
+        method: get
+        endpoint: '${ $secret.snello.apiUrl + "/api/kayaks?_limit=1000&select_fields=uuid,name,level,category,length,width" }'
+  # . is the array returned by fetchKayaks: each value below is a jq expression over it
+  - summarize:
+      set:
+        total: '${ length }'
+        byLevel: '${ group_by(.level) | map({key: (.[0].level // "unknown"), value: length}) | from_entries }'
+        byCategory: '${ group_by(.category) | map({key: (.[0].category // "unknown"), value: length}) | from_entries }'
+        longest: '${ max_by(.length) | {name, length} }'
+        narrowest: '${ map(select(.width != null)) | min_by(.width) | {name, width} }'
+  - report:
+      call: http
+      with:
+        method: post
+        endpoint: http://127.0.0.1:8099/explore/kayak-stats
+        headers:
+          content-type: application/json
+        body: '${ . }'

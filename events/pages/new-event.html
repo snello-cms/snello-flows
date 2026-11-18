@@ -1,0 +1,65 @@
+<!--
+  Workflow page new-event (snello workflowpages, served at /p/new-event?key={event uuid}).
+  Linked from the snello:new-event mail; written into snello by events/setup.py.
+  No human task: a read-only view of one event. The page holds no data, it reads the event after login with the
+  viewer's token, so the events table's own rules decide who sees it.
+-->
+<style>
+  .ev-title{font-size:13px;text-transform:uppercase;letter-spacing:.05em;color:#888;margin:0 0 8px}
+  .ev-desc{line-height:1.5} #ev-preview{white-space:pre-wrap}
+  .ev-actions{margin-top:12px}
+</style>
+
+<div class="sp-wrap">
+  <h1 class="sp-h1" id="ev-name">New event</h1>
+  <div class="sp-muted sp-small" id="ev-sub">Loading…</div>
+
+  <div class="sp-card" style="margin-top:16px">
+    <p class="ev-title">When and where</p>
+    <table class="sp-table" id="ev-where"></table>
+  </div>
+
+  <div class="sp-card">
+    <p class="ev-title">Preview</p>
+    <div class="ev-desc" id="ev-preview">–</div>
+    <p class="ev-title" style="margin-top:16px">Description</p>
+    <div class="ev-desc" id="ev-desc">–</div>
+    <div class="ev-actions"><a id="ev-edit" class="sp-btn" href="#">Edit in snello admin</a></div>
+  </div>
+</div>
+
+<script>
+(async function () {
+  const esc = snello.esc;
+  const row = (label, value) => '<tr><td>' + esc(label) + '</td><td>'
+    + (value == null || value === '' ? '<span class="sp-muted">–</span>' : esc(value)) + '</td></tr>';
+  const day = (v) => v ? new Date(v + 'T00:00:00').toLocaleDateString() : null;
+
+  const key = snello.params.key;
+  if (!key) {
+    snello.fatal(Object.assign(new Error('this page needs ?key=<event uuid>'), {status: 400}));
+    return;
+  }
+  await snello.ready();
+  let ev;
+  try {
+    ev = await snello.api.get('events/' + encodeURIComponent(key));
+  } catch (e) {
+    snello.fatal(e);
+    return;
+  }
+  console.log('[new-event] event', ev.uuid);
+  document.title = ev.name || 'Event';
+  document.getElementById('ev-name').textContent = ev.name || ev.uuid;
+  const dates = [day(ev.begin_date), day(ev.end_date)].filter(Boolean);
+  document.getElementById('ev-sub').textContent = (dates.length ? dates.join(' – ') : 'no dates') + ' · '
+    + [ev.city, ev.nation].filter(Boolean).join(', ');
+  document.getElementById('ev-where').innerHTML = row('Begins', day(ev.begin_date)) + row('Ends', day(ev.end_date))
+    + row('City', ev.city) + row('Province', ev.province) + row('Nation', ev.nation) + row('Continent', ev.continent);
+  document.getElementById('ev-preview').textContent = ev.preview || '–';
+  // description is rich text (tinymce) written by someone else: formatting kept, anything that could run dropped
+  document.getElementById('ev-desc').innerHTML = ev.description ? snello.safeHtml(ev.description) : '–';
+  // the admin is served by the same snello (all-in-one image): its edit form for this row
+  document.getElementById('ev-edit').href = '/#/datalist/edit/events/' + encodeURIComponent(ev.uuid);
+})();
+</script>

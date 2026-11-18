@@ -1,0 +1,405 @@
+document:
+  dsl: "1.0.0"
+  namespace: contracts
+  name: contract-evaluation
+  version: "1.0.0"
+  title: Rent contract evaluation
+  summary: >-
+    Started by the snello Action rent-contracts-post-persist with {"contract": {...}, "idCardUrl": "..."}.
+    Opens a snello human task (decisions ACCEPT / REFUSE, page /p/rent-contract-review), mails the reviewer its
+    link, waits for the decision (polling the task; a decision counts only if still unchanged after the grace
+    period, which is what makes UNDO work), closes the task, approves or refuses the contract, mails the applicant
+    (cc the reviewer) and closes the instance row.
+use:
+  # Values from MicroProfile config (config/application.properties):
+  #   snello.apiUrl, snelloAuth.clientId / clientSecret (Keycloak client, realm role Manager)
+  #   contracts.reviewer, contracts.cc (comma separated), contracts.phone
+  secrets:
+    - snello
+    - snelloAuth
+    - contracts
+  retries:
+    # snello calls: 5xx / 429 / connection errors, 5 attempts, exponential from 5 s
+    snelloRetry:
+      delay:
+        seconds: 5
+      backoff:
+        exponential: {}
+      limit:
+        attempt:
+          count: 5
+  authentications:
+    snelloService:
+      # literal (the schema rejects expressions here); per environment, change it here
+      oauth2:
+        authority: http://localhost:8180/realms/snello
+        endpoints:
+          token: /protocol/openid-connect/token
+        grant: client_credentials
+        client:
+          id: ${ $secret.snelloAuth.clientId }
+          secret: ${ $secret.snelloAuth.clientSecret }
+input:
+  schema:
+    format: json
+    document:
+      type: object
+      required:
+        - contract
+      properties:
+        contract:
+          type: object
+          required: [uuid, name, surname, email]
+        idCardUrl:
+          type: [string, "null"]
+do:
+  # $context = {contract, idCardUrl, taskId, reviewUrl} for the whole run.
+  # Flow: in export.as . is the current context and the task result is $output.
+  - init:
+      set:
+        contract: '${ .contract }'
+        idCardUrl: '${ .idCardUrl }'
+      export:
+        as: '${ $output }'
+
+  # The decision is a snello human task: snello checks who may decide and what, the page only shows it.
+  # reviewUrl = the task's page: {snello public url}/p/rent-contract-review?task={task uuid}
+  - createTask:
+      try:
+        - post:
+            call: http
+            with:
+              method: post
+              endpoint:
+                uri: '${ $secret.snello.apiUrl + "/api/humantasks" }'
+                authentication:
+                  use: snelloService
+              headers:
+                content-type: application/json
+              body:
+                title: '${ "Rent contract: " + $context.contract.name + " " + $context.contract.surname }'
+                description: '${ "Asset: " + ($context.contract.asset_request // "-") }'
+                page_name: rent-contract-review
+                workflow_namespace: contracts
+                workflow_name: contract-evaluation
+                workflow_version: 1.0.0
+                instance_id: '${ $workflow.id }'
+                record_table: rent_contracts
+                record_key: '${ $context.contract.uuid }'
+                decisions: ACCEPT,REFUSE
+                roles: Admin,Manager
+      catch:
+        errors:
+          with:
+            type: https://serverlessworkflow.io/spec/1.0.0/errors/communication
+        exceptWhen: '${ .status >= 400 and .status < 500 and .status != 429 }'
+        retry: snelloRetry
+      export:
+        as: '${ . + {taskId: $output.uuid, reviewUrl: $output.url} }'
+
+  - mailReviewer:
+      try:
+        - post:
+            call: http
+            with:
+              method: post
+              endpoint:
+                uri: '${ $secret.snello.apiUrl + "/api/mail/send" }'
+                authentication:
+                  use: snelloService
+              headers:
+                content-type: application/json
+              body:
+                to: '${ $secret.contracts.reviewer | split(",") | map(gsub("^\\s+|\\s+$"; "")) }'
+                subject: '${ "Rent contract to review: " + $context.contract.name + " " + $context.contract.surname }'
+                html: >-
+                  ${ "A new rent request is waiting for your review.<br><br>"
+                     + "<b>" + ($context.contract.name | @html) + " " + ($context.contract.surname | @html) + "</b> &lt;"
+                     + ($context.contract.email | @html) + "&gt;<br>"
+                     + "Asset: " + (($context.contract.asset_request // "-") | @html) + "<br><br>"
+                     + "<a href=\"" + ($context.reviewUrl | @html) + "\">Review the contract and ACCEPT or REFUSE</a><br>"
+                     + (if $context.idCardUrl then "<a href=\"" + ($context.idCardUrl | @html) + "\">Download the ID card</a><br>" else "" end)
+                     + "<br><small>workflow contracts:contract-evaluation, instance " + ($workflow.id | @html) + "</small>" }
+      catch:
+        errors:
+          with:
+            type: https://serverlessworkflow.io/spec/1.0.0/errors/communication
+        # 4xx other than 429 will not get better (bad payload, login, role): fail at once
+        exceptWhen: '${ .status >= 400 and .status < 500 and .status != 429 }'
+        retry: snelloRetry
+
+  # The emailed link, also on the instance row (field review_url) so it can be opened from snello admin.
+  # Stored as an <a> tag: the admin renders HTML only for rich-text fields; plain fields are printed as text.
+  # The row is created by the snello action right after this workflow starts: a 404 here is retried too.
+  - storeReviewUrl:
+      try:
+        - put:
+            call: http
+            with:
+              method: put
+              endpoint:
+                uri: '${ $secret.snello.apiUrl + "/api/rent_contracts_workflow_instances/" + ($context.contract.uuid | @uri) }'
+                authentication:
+                  use: snelloService
+              headers:
+                content-type: application/json
+              body:
+                review_url: >-
+                  ${ "<a href=\"" + ($context.reviewUrl | @html) + "\" target=\"_blank\">"
+                     + ($context.reviewUrl | @html) + "</a>" }
+      catch:
+        errors:
+          with:
+            type: https://serverlessworkflow.io/spec/1.0.0/errors/communication
+        exceptWhen: '${ .status >= 400 and .status < 500 and .status != 429 and .status != 404 }'
+        retry: snelloRetry
+
+  # ---- wait for the reviewer: poll the human task (the page decides through snello) ----
+  - waitDecision:
+      wait:
+        seconds: 20
+  - readDecision:
+      try:
+        - get:
+            call: http
+            with:
+              method: get
+              endpoint:
+                uri: '${ $secret.snello.apiUrl + "/api/humantasks/" + ($context.taskId | @uri) }'
+                authentication:
+                  use: snelloService
+      catch:
+        errors:
+          with:
+            type: https://serverlessworkflow.io/spec/1.0.0/errors/communication
+        # 4xx other than 429 will not get better (bad payload, login, role): fail at once
+        exceptWhen: '${ .status >= 400 and .status < 500 and .status != 429 }'
+        retry: snelloRetry
+      # remember what was seen, to compare after the grace period
+      export:
+        as: '${ . + {seen: {decision: $output.decision, at: $output.decided_at}} }'
+  - route:
+      switch:
+        - decided:
+            when: '${ .decision == "ACCEPT" or .decision == "REFUSE" }'
+            then: graceForUndo
+        - stillWaiting:
+            then: waitDecision
+
+  # UNDO window: the decision is applied only if decision + decided_at are unchanged after this wait
+  - graceForUndo:
+      wait:
+        seconds: 30
+  - confirmDecision:
+      try:
+        - get:
+            call: http
+            with:
+              method: get
+              endpoint:
+                uri: '${ $secret.snello.apiUrl + "/api/humantasks/" + ($context.taskId | @uri) }'
+                authentication:
+                  use: snelloService
+      catch:
+        errors:
+          with:
+            type: https://serverlessworkflow.io/spec/1.0.0/errors/communication
+        # 4xx other than 429 will not get better (bad payload, login, role): fail at once
+        exceptWhen: '${ .status >= 400 and .status < 500 and .status != 429 }'
+        retry: snelloRetry
+  - branch:
+      switch:
+        - accepted:
+            when: '${ .decision == "ACCEPT" and .decision == $context.seen.decision and .decided_at == $context.seen.at }'
+            then: closeTaskApproved
+        - refused:
+            when: '${ .decision == "REFUSE" and .decision == $context.seen.decision and .decided_at == $context.seen.at }'
+            then: closeTaskRefused
+        # undone or changed during the grace period: back to waiting
+        - changed:
+            then: waitDecision
+
+  # ---- ACCEPT path ----
+  # the decision is being applied: close the task (no more UNDO, the page shows CLOSED)
+  - closeTaskApproved:
+      try:
+        - post:
+            call: http
+            with:
+              method: post
+              endpoint:
+                uri: '${ $secret.snello.apiUrl + "/api/humantasks/" + ($context.taskId | @uri) + "/close" }'
+                authentication:
+                  use: snelloService
+              headers:
+                content-type: application/json
+              body:
+                note: contract approved
+      catch:
+        errors:
+          with:
+            type: https://serverlessworkflow.io/spec/1.0.0/errors/communication
+        exceptWhen: '${ .status >= 400 and .status < 500 and .status != 429 }'
+        retry: snelloRetry
+  # PUT status APPROUVED: snello's PRE MERGE action also stores the contract PDF in documents (S3) in the same call
+  - approveContract:
+      try:
+        - put:
+            call: http
+            with:
+              method: put
+              endpoint:
+                uri: '${ $secret.snello.apiUrl + "/api/rent_contracts/" + ($context.contract.uuid | @uri) }'
+                authentication:
+                  use: snelloService
+              headers:
+                content-type: application/json
+              body:
+                status: APPROUVED
+      catch:
+        errors:
+          with:
+            type: https://serverlessworkflow.io/spec/1.0.0/errors/communication
+        # 4xx other than 429 will not get better (bad payload, login, role): fail at once
+        exceptWhen: '${ .status >= 400 and .status < 500 and .status != 429 }'
+        retry: snelloRetry
+  - mailApproved:
+      try:
+        - post:
+            call: http
+            with:
+              method: post
+              endpoint:
+                uri: '${ $secret.snello.apiUrl + "/api/mail/send" }'
+                authentication:
+                  use: snelloService
+              headers:
+                content-type: application/json
+              body:
+                to: '${ [$context.contract.email] }'
+                cc: '${ $secret.contracts.cc | split(",") | map(gsub("^\\s+|\\s+$"; "")) }'
+                subject: Your rent contract is approved
+                html: >-
+                  ${ "Dear " + ($context.contract.name | @html) + " " + ($context.contract.surname | @html)
+                     + ",<br><br>your contract is approved. You will receive more info in one day." }
+      catch:
+        errors:
+          with:
+            type: https://serverlessworkflow.io/spec/1.0.0/errors/communication
+        # 4xx other than 429 will not get better (bad payload, login, role): fail at once
+        exceptWhen: '${ .status >= 400 and .status < 500 and .status != 429 }'
+        retry: snelloRetry
+  - closeApproved:
+      try:
+        - put:
+            call: http
+            with:
+              method: put
+              endpoint:
+                uri: '${ $secret.snello.apiUrl + "/api/rent_contracts_workflow_instances/" + ($context.contract.uuid | @uri) }'
+                authentication:
+                  use: snelloService
+              headers:
+                content-type: application/json
+              body:
+                final_status: APPROUVED
+      catch:
+        errors:
+          with:
+            type: https://serverlessworkflow.io/spec/1.0.0/errors/communication
+        # 4xx other than 429 will not get better (bad payload, login, role): fail at once
+        exceptWhen: '${ .status >= 400 and .status < 500 and .status != 429 }'
+        retry: snelloRetry
+      then: end
+
+  # ---- REFUSE path ----
+  # the decision is being applied: close the task (no more UNDO, the page shows CLOSED)
+  - closeTaskRefused:
+      try:
+        - post:
+            call: http
+            with:
+              method: post
+              endpoint:
+                uri: '${ $secret.snello.apiUrl + "/api/humantasks/" + ($context.taskId | @uri) + "/close" }'
+                authentication:
+                  use: snelloService
+              headers:
+                content-type: application/json
+              body:
+                note: contract refused
+      catch:
+        errors:
+          with:
+            type: https://serverlessworkflow.io/spec/1.0.0/errors/communication
+        exceptWhen: '${ .status >= 400 and .status < 500 and .status != 429 }'
+        retry: snelloRetry
+  - refuseContract:
+      try:
+        - put:
+            call: http
+            with:
+              method: put
+              endpoint:
+                uri: '${ $secret.snello.apiUrl + "/api/rent_contracts/" + ($context.contract.uuid | @uri) }'
+                authentication:
+                  use: snelloService
+              headers:
+                content-type: application/json
+              body:
+                status: REFUSED
+      catch:
+        errors:
+          with:
+            type: https://serverlessworkflow.io/spec/1.0.0/errors/communication
+        # 4xx other than 429 will not get better (bad payload, login, role): fail at once
+        exceptWhen: '${ .status >= 400 and .status < 500 and .status != 429 }'
+        retry: snelloRetry
+  - mailRefused:
+      try:
+        - post:
+            call: http
+            with:
+              method: post
+              endpoint:
+                uri: '${ $secret.snello.apiUrl + "/api/mail/send" }'
+                authentication:
+                  use: snelloService
+              headers:
+                content-type: application/json
+              body:
+                to: '${ [$context.contract.email] }'
+                cc: '${ $secret.contracts.cc | split(",") | map(gsub("^\\s+|\\s+$"; "")) }'
+                subject: Your rent contract is refused
+                html: >-
+                  ${ "Dear " + ($context.contract.name | @html) + " " + ($context.contract.surname | @html)
+                     + ",<br><br>your contract is refused. Call us to receive more info: " + ($secret.contracts.phone | @html) }
+      catch:
+        errors:
+          with:
+            type: https://serverlessworkflow.io/spec/1.0.0/errors/communication
+        # 4xx other than 429 will not get better (bad payload, login, role): fail at once
+        exceptWhen: '${ .status >= 400 and .status < 500 and .status != 429 }'
+        retry: snelloRetry
+  - closeRefused:
+      try:
+        - put:
+            call: http
+            with:
+              method: put
+              endpoint:
+                uri: '${ $secret.snello.apiUrl + "/api/rent_contracts_workflow_instances/" + ($context.contract.uuid | @uri) }'
+                authentication:
+                  use: snelloService
+              headers:
+                content-type: application/json
+              body:
+                final_status: REFUSED
+      catch:
+        errors:
+          with:
+            type: https://serverlessworkflow.io/spec/1.0.0/errors/communication
+        # 4xx other than 429 will not get better (bad payload, login, role): fail at once
+        exceptWhen: '${ .status >= 400 and .status < 500 and .status != 429 }'
+        retry: snelloRetry
+      then: end

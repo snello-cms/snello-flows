@@ -1,0 +1,55 @@
+document:
+  dsl: "1.0.0"
+  namespace: explore
+  name: safe-lookup
+  version: "1.0.0"
+  title: Safe lookup
+  summary: >-
+    Feature: try/catch with a typed error filter. A 404 from snello is caught and replaced by a fallback
+    (no retry: a missing record will not appear by retrying); any other error still fails the workflow.
+    Input {"key": "<kayak uuid>"}.
+use:
+  secrets:
+    - snello
+input:
+  schema:
+    format: json
+    document:
+      type: object
+      required:
+        - key
+      properties:
+        key:
+          type: string
+do:
+  - lookup:
+      try:
+        - get:
+            call: http
+            with:
+              method: get
+              endpoint: '${ $secret.snello.apiUrl + "/api/kayaks/" + (.key | @uri) }'
+        - found:
+            set:
+              found: true
+              name: '${ .name }'
+              level: '${ .level }'
+      catch:
+        errors:
+          with:
+            type: https://serverlessworkflow.io/spec/1.0.0/errors/communication
+            status: 404
+        do:
+          - notFound:
+              set:
+                found: false
+                key: '${ $workflow.input.key }'
+                reason: snello answered 404
+  - report:
+      call: http
+      with:
+        method: post
+        endpoint: http://127.0.0.1:8099/explore/safe-lookup
+        headers:
+          content-type: application/json
+        body: '${ . }'

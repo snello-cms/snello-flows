@@ -1,0 +1,63 @@
+document:
+  dsl: "1.0.0"
+  namespace: explore
+  name: kayak-advice
+  version: "1.0.0"
+  title: Kayak advice
+  summary: >-
+    Feature: switch + then (branching). Reads one kayak and jumps to a different task per level;
+    every branch ends at report. Input {"key": "<kayak uuid>"}.
+use:
+  secrets:
+    - snello
+input:
+  schema:
+    format: json
+    document:
+      type: object
+      required:
+        - key
+      properties:
+        key:
+          type: string
+do:
+  - fetchKayak:
+      call: http
+      with:
+        method: get
+        endpoint: '${ $secret.snello.apiUrl + "/api/kayaks/" + (.key | @uri) }'
+  - route:
+      switch:
+        - beginner:
+            when: '${ .level == "beginner" }'
+            then: forBeginners
+        - advanced:
+            when: '${ .level == "advanced" }'
+            then: forRacers
+        - anythingElse:
+            then: forEveryoneElse
+  - forBeginners:
+      set:
+        kayak: '${ .name }'
+        branch: beginner
+        advice: '${ "Stable boat, " + (.width | tostring) + " cm wide: a good first ski." }'
+      then: report
+  - forRacers:
+      set:
+        kayak: '${ .name }'
+        branch: advanced
+        advice: '${ "Race hull, " + (.length | tostring) + " cm long: needs balance and practice." }'
+      then: report
+  - forEveryoneElse:
+      set:
+        kayak: '${ .name }'
+        branch: other
+        advice: '${ "Level \"" + (.level // "unknown") + "\": check the spec sheet." }'
+  - report:
+      call: http
+      with:
+        method: post
+        endpoint: http://127.0.0.1:8099/explore/kayak-advice
+        headers:
+          content-type: application/json
+        body: '${ . }'

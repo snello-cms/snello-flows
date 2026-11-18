@@ -1,0 +1,49 @@
+document:
+  dsl: "1.0.0"
+  namespace: explore
+  name: brand-census
+  version: "1.0.0"
+  title: Brand census
+  summary: >-
+    Feature: for loop + $context. Reads the brands, then one http call per brand counts its kayaks;
+    each iteration appends to $context.counts through export.as. No input.
+use:
+  secrets:
+    - snello
+do:
+  - fetchBrands:
+      call: http
+      with:
+        method: get
+        endpoint: '${ $secret.snello.apiUrl + "/api/brands?_limit=100&select_fields=uuid,name" }'
+      # start the accumulator; the task output (the brands) still flows on as input of the loop
+      export:
+        as: '${ {counts: []} }'
+  - countPerBrand:
+      for:
+        each: brand
+        in: '${ . }'
+      do:
+        - countKayaks:
+            call: http
+            with:
+              method: get
+              endpoint: '${ $secret.snello.apiUrl + "/api/kayaks?_limit=1000&select_fields=uuid&brand=" + ($brand.uuid | @uri) }'
+            # Flow 1.0.0: in export.as, . is the current CONTEXT and the task result is $output
+            # (the spec says . is the output). With length on . every brand counted 1.
+            export:
+              as: '${ {counts: (.counts + [{brand: $brand.name, kayaks: ($output | length)}])} }'
+  - summarize:
+      set:
+        brands: '${ $context.counts | length }'
+        kayaks: '${ $context.counts | map(.kayaks) | add }'
+        ranking: '${ $context.counts | map(select(.kayaks > 0)) | sort_by(-.kayaks) }'
+        withoutKayaks: '${ $context.counts | map(select(.kayaks == 0) | .brand) }'
+  - report:
+      call: http
+      with:
+        method: post
+        endpoint: http://127.0.0.1:8099/explore/brand-census
+        headers:
+          content-type: application/json
+        body: '${ . }'

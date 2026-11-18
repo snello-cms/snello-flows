@@ -1,0 +1,104 @@
+document:
+  dsl: "1.0.0"
+  namespace: snello
+  name: new-event
+  version: "1.0.0"
+  title: New event notification
+  summary: >-
+    Called by the snello POST PERSIST Action on events with {"key": "<event uuid>"}.
+    Reads the event from the snello API (service token) and mails "we added a new event" through snello's
+    POST /api/mail/send (snello's own SMTP settings), retrying 5xx/429. The mail links to the workflow page
+    {publicUrl}/p/new-event?key=<uuid> (snello-flows/events/pages/new-event.html, uploaded by events/setup.py).
+use:
+  # Values from MicroProfile config (config/application.properties):
+  #   snello.apiUrl, snello.publicUrl, notify.to (comma separated)
+  #   snelloAuth.clientId, snelloAuth.clientSecret (Keycloak client with realm role Manager)
+  secrets:
+    - snello
+    - notify
+    - snelloAuth
+  authentications:
+    snelloService:
+      # authority must be a literal URI (the schema rejects expressions): local dev here; aruba-k8s
+      # scripts/flow-runner-workflows.sh renders the cluster copy with the cluster's Keycloak
+      oauth2:
+        authority: http://localhost:8180/realms/snello
+        endpoints:
+          token: /protocol/openid-connect/token
+        grant: client_credentials
+        client:
+          id: ${ $secret.snelloAuth.clientId }
+          secret: ${ $secret.snelloAuth.clientSecret }
+input:
+  schema:
+    format: json
+    document:
+      type: object
+      required:
+        - key
+      properties:
+        key:
+          type: string
+do:
+  - fetchEvent:
+      try:
+        - get:
+            call: http
+            with:
+              method: get
+              # with the service token: still works once events is no longer readable anonymously
+              endpoint:
+                uri: '${ $secret.snello.apiUrl + "/api/events/" + .key }'
+                authentication:
+                  use: snelloService
+              headers:
+                accept: application/json
+      catch:
+        errors:
+          with:
+            type: https://serverlessworkflow.io/spec/1.0.0/errors/communication
+        # 4xx other than 429 (event deleted, bad request) will not get better: fail at once.
+        # In Flow 1.0 the caught error is the input (.) of exceptWhen; a catch 'as' variable is not bound.
+        exceptWhen: '${ .status >= 400 and .status < 500 and .status != 429 }'
+        retry:
+          delay:
+            seconds: 2
+          backoff:
+            exponential: {}
+          limit:
+            attempt:
+              count: 3
+  - sendMail:
+      try:
+        - post:
+            call: http
+            with:
+              method: post
+              endpoint:
+                uri: '${ $secret.snello.apiUrl + "/api/mail/send" }'
+                authentication:
+                  use: snelloService
+              headers:
+                content-type: application/json
+                accept: application/json
+              body:
+                to: '${ $secret.notify.to | split(",") | map(gsub("^\\s+|\\s+$"; "")) }'
+                subject: '${ "New event: " + .name }'
+                html: >-
+                  ${ "we added a new event: <b>" + (.name | @html) + "</b> " + ((.begin_date // "") | tostring | @html)
+                     + "<br><a href=\"" + $secret.snello.publicUrl + "/p/new-event?key=" + (.uuid | @uri) + "\">"
+                     + "Open the event</a>" }
+      catch:
+        errors:
+          with:
+            type: https://serverlessworkflow.io/spec/1.0.0/errors/communication
+        # 400 (bad payload), 401/403 (login / role) will not get better; 502 (SMTP down) and 429 are retried
+        exceptWhen: '${ .status >= 400 and .status < 500 and .status != 429 }'
+        retry:
+          delay:
+            seconds: 5
+          backoff:
+            exponential: {}
+          limit:
+            attempt:
+              count: 5

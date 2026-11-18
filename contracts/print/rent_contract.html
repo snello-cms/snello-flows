@@ -1,0 +1,29 @@
+<html><head><style>
+@page { size: A4; margin: 20mm }
+body { font-family: sans-serif; font-size: 11pt; color: #222 }
+h1 { font-size: 18pt; margin: 0 0 4mm 0 }
+.muted { color: #666; font-size: 9pt }
+table { border-collapse: collapse; width: 100%; margin-top: 6mm }
+th { text-align: left; width: 35%; background: #f2f2f2 }
+th, td { border: 1px solid #bbb; padding: 2mm 3mm; vertical-align: top }
+.sign { margin-top: 25mm }
+.sign td { border: none; border-top: 1px solid #222; width: 45%; padding-top: 2mm; text-align: center }
+.gap { border: none; border-top: none; width: 10% }
+</style></head><body>
+{#for row in rows}
+<h1>Rent contract</h1>
+<div class="muted">Contract {row.uuid} &middot; printed {now}</div>
+<table>
+<tr><th>Name</th><td>{row.name ?: ''} {row.surname ?: ''}</td></tr>
+<tr><th>Birthdate</th><td>{row.birthdate ?: ''}</td></tr>
+<tr><th>Email</th><td>{row.email ?: ''}</td></tr>
+<tr><th>Phone</th><td>{row.phone ?: ''}</td></tr>
+<tr><th>Requested asset</th><td>{row.asset_request ?: ''}</td></tr>
+<tr><th>ID card on file</th><td>{#if row.id_card}yes (document {row.id_card}){#else}not uploaded yet{/if}</td></tr>
+<tr><th>Request date</th><td>{row.creation_date ?: ''}</td></tr>
+</table>
+<p>The applicant asks to rent the asset described above. The request is subject to evaluation; this document
+becomes binding only once the request is approved.</p>
+<table class="sign"><tr><td>Applicant</td><td class="gap"></td><td>Lessor</td></tr></table>
+{/for}
+</body></html>

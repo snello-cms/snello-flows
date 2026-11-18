@@ -1,0 +1,96 @@
+<!--
+  Workflow page rent-contract-review (snello workflowpages, served at /p/rent-contract-review?task={uuid}).
+  Written into snello by contracts/setup.py. Runs with the snello page client (window.snello): it holds no data,
+  everything is read after login with the reviewer's token, and the decision goes through snello's task rules.
+-->
+<style>
+  .rc-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+  @media (max-width:700px){.rc-grid{grid-template-columns:1fr}}
+  .rc-title{font-size:13px;text-transform:uppercase;letter-spacing:.05em;color:#888;margin:0 0 8px}
+  .rc-big{font-size:20px;font-weight:600}
+  .rc-steps{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+  .rc-step{font-size:12px;padding:2px 8px;border-radius:10px;background:#eee;color:#555}
+  .rc-step.done{background:#d1e7dd;color:#0a3622} .rc-step.now{background:#cfe2ff;color:#052c65;font-weight:600}
+  .rc-actions a, .rc-actions button{margin-right:8px}
+  .rc-link{background:none;border:0;color:#0d6efd;text-decoration:underline;cursor:pointer;padding:0;font:inherit}
+</style>
+
+<div class="sp-wrap">
+  <h1 class="sp-h1" id="rc-heading">Rent contract</h1>
+  <div class="sp-muted sp-small" id="rc-sub">Loading…</div>
+
+  <div class="rc-grid" style="margin-top:16px">
+    <div class="sp-card">
+      <p class="rc-title">Applicant</p>
+      <div class="rc-big" id="rc-name">–</div>
+      <table class="sp-table" id="rc-applicant"></table>
+    </div>
+    <div class="sp-card">
+      <p class="rc-title">Request</p>
+      <div id="rc-asset" style="white-space:pre-wrap">–</div>
+      <table class="sp-table" id="rc-request" style="margin-top:8px"></table>
+    </div>
+  </div>
+
+  <div class="sp-card">
+    <p class="rc-title">Documents</p>
+    <div class="rc-actions">
+      <span id="rc-idcard"></span>
+      <button class="rc-link" id="rc-pdf">Contract PDF (as it will be signed)</button>
+      <span id="rc-pdf-err" class="sp-muted sp-small"></span>
+    </div>
+  </div>
+
+  <div class="sp-card">
+    <p class="rc-title">Workflow</p>
+    <div id="rc-workflow" class="sp-small sp-muted">–</div>
+    <div class="rc-steps" id="rc-steps"></div>
+  </div>
+
+  <!-- decision bar: status, who decided, comment, ACCEPT / REFUSE, UNDO -->
+  <div id="rc-decisions"></div>
+</div>
+
+<script>
+(function () {
+  const esc = snello.esc;
+  const row = (label, value) => '<tr><td>' + esc(label) + '</td><td>' + (value == null || value === '' ? '<span class="sp-muted">–</span>' : esc(value)) + '</td></tr>';
+  const when = (v) => v ? new Date(v).toLocaleString() : null;
+  const STEPS = ['createTask', 'mailReviewer', 'waitDecision', 'graceForUndo', 'closeTaskApproved', 'closeTaskRefused',
+    'approveContract', 'refuseContract', 'mailApproved', 'mailRefused', 'closeApproved', 'closeRefused'];
+
+  snello.onChange(({task, record, workflow}) => {
+    const c = record || {};
+    document.getElementById('rc-heading').textContent = task.title;
+    document.getElementById('rc-sub').innerHTML = 'Request received ' + esc(when(c.creation_date) || '?')
+      + ' · contract status <b>' + esc(c.status || '?') + '</b>';
+    document.getElementById('rc-name').textContent = (c.name || '') + ' ' + (c.surname || '');
+    document.getElementById('rc-applicant').innerHTML = row('Email', c.email) + row('Phone', c.phone) + row('Birthdate', c.birthdate);
+    document.getElementById('rc-asset').textContent = c.asset_request || '–';
+    document.getElementById('rc-request').innerHTML = row('Last update', when(c.last_update)) + row('Contract id', c.uuid);
+    document.getElementById('rc-idcard').innerHTML = c.id_card
+      ? '<a href="/api/documents/' + encodeURIComponent(c.id_card) + '/download" target="_blank" rel="noopener">ID card</a>'
+      : '<span class="sp-muted">ID card not uploaded yet</span>';
+    if (workflow) {
+      const done = new Set(Object.values(workflow.tasks || {}).map(t => t.name));
+      document.getElementById('rc-workflow').innerHTML = 'contracts:contract-evaluation · instance <code>' + esc(workflow.instanceId)
+        + '</code> · <b>' + esc(workflow.status) + '</b>' + (workflow.currentTask ? ' at <b>' + esc(workflow.currentTask) + '</b>' : '');
+      document.getElementById('rc-steps').innerHTML = STEPS.filter(s => done.has(s) || s === workflow.currentTask)
+        .map(s => '<span class="rc-step ' + (s === workflow.currentTask ? 'now' : 'done') + '">' + esc(s) + '</span>').join('');
+    }
+  });
+
+  // the contract PDF is a protected print: fetched with the reviewer's token
+  document.getElementById('rc-pdf').addEventListener('click', async () => {
+    const ctx = await snello.context();
+    try {
+      const pdf = await snello.api.blob('printtemplates/rent_contract/print?uuid=' + encodeURIComponent(ctx.task.record_key) + '&_inline=true');
+      window.open(URL.createObjectURL(pdf), '_blank');
+    } catch (e) {
+      document.getElementById('rc-pdf-err').textContent = e.message;
+    }
+  });
+
+  snello.renderDecisions(document.getElementById('rc-decisions'));
+})();
+</script>

@@ -1,0 +1,43 @@
+# Quarkus Flow runner, local. docker compose up -d   (logs: docker compose logs -f flow-runner)
+# minimal = MVStore persistence (H2's storage engine, one file in ./data), no Kafka, single replica.
+services:
+  flow-runner:
+    image: quay.io/quarkiverse/quarkus-flow-runner:1.3.0-minimal
+    container_name: flow-runner
+    # host network: snello-control (127.0.0.1:8080) and Keycloak (localhost:8180) are reached as on the host
+    network_mode: host
+    # host uid, so ./data (the MVStore file) is writable and owned by you for backups
+    user: "${UID:-1000}:${GID:-1000}"
+    environment:
+      QUARKUS_HTTP_HOST: 127.0.0.1
+      QUARKUS_HTTP_PORT: "8090"
+      QUARKUS_FLOW_PERSISTENCE_MVSTORE_DB_PATH: /deployments/data/flowRunnerData.mv
+    volumes:
+      - ./workflows:/deployments/workflows:ro
+      - ./config:/deployments/config:ro
+      - ./data:/deployments/data
+    restart: unless-stopped
+
+  # Monitoring helper: follows the runner's event file (data/flow-events.log) and answers "where is each instance"
+  # on http://127.0.0.1:8091 (/instances, /instances/{id}). snello's /api/flow/* reads it.
+  # Also deploys workflows saved in the snello admin (PUT /workflows/...): writes workflows/ui-*.yaml (git-ignored)
+  # and waits for the runner to register it. snello needs SNELLO_FLOW_BRIDGE_TOKEN = the same token.
+  flow-bridge:
+    image: python:3.13-alpine
+    container_name: flow-bridge
+    network_mode: host
+    user: "${UID:-1000}:${GID:-1000}"
+    command: ["python3", "-u", "/bridge/flow_bridge.py"]
+    environment:
+      BRIDGE_HOST: 127.0.0.1
+      BRIDGE_PORT: "8091"
+      FLOW_EVENTS_FILE: /deployments/data/flow-events.log
+      FLOW_WATCHER_LOG: /deployments/data/flow-watcher.log
+      WORKFLOWS_DIR: /deployments/workflows
+      RUNNER_URL: http://127.0.0.1:8090
+      BRIDGE_WRITE_TOKEN: "${FLOW_BRIDGE_TOKEN:-snello-bridge-dev-token}"   # dev only, bound to 127.0.0.1
+    volumes:
+      - ./bridge:/bridge:ro
+      - ./data:/deployments/data:ro
+      - ./workflows:/deployments/workflows
+    restart: unless-stopped

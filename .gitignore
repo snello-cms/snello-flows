@@ -1,0 +1,11 @@
+config/application.properties
+data/
+backups/
+__pycache__/
+*.pyc
+# deployed from the snello admin (Workflows) through flow-bridge: their source of truth is snello's workflowdefinitions
+workflows/ui-*.yaml
+workflows/.ui-*.tmp
+# IntelliJ
+.idea/
+*.iml
