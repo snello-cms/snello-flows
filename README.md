@@ -181,6 +181,28 @@ quarkus.log.handler.file."WATCH_FILE".rotation.max-backup-index=1
 quarkus.log.category."io.quarkiverse.flow.runner.WorkflowFileWatcher".handlers=WATCH_FILE
 ```
 
+## Default approval (any table): snello:record-approval + Actions template
+
+snello seeds the workflow **`snello:record-approval`** (Workflows, badge *default*, DRAFT) once if no version of it
+exists, with its Keycloak authority taken from `quarkus.oidc.auth-server-url`; source: snello-api
+`snello-core/src/main/resources/io/snello/flows/record-approval.yaml`. It is a normal row: deploy it once, change it as
+a new version (`snello.flow.seed-defaults=false` turns seeding off).
+
+Per table: Actions > New > table > **Insert approval template** (PERSIST / POST) and edit its `SETTINGS`: `emailField`,
+`reviewer` (who gets the APPROVE / REFUSE link), the approved / refused mail subject and HTML (functions of the row).
+A new row starts the workflow: human task on the row (the generic page `/p/task` shows the row's fields), link mailed to
+the reviewer, decision with 15 s UNDO, then the approved or refused mail to the row's address. Tested 2026-11-18 on a
+table `requests` (name, email, request) with mails mocked (`SNELLO_MAIL_MOCK=true`).
+
+## demo:approval (approve / refuse, the whole human-task loop)
+
+`demo/approval.yaml` + workflow page `demo/pages/approval-demo.html` (Workflow Pages row `approval-demo`). In the admin:
+Workflows > Add > **Insert approval example** (the Keycloak authority is filled in from the admin's config) > Save >
+Deploy > **Run** with `{"title": "...", "details": "...", "requester": "..."}`. The Run panel follows the instance and
+shows **Open approval page** for its task: APPROVE / REFUSE there (UNDO for 15 s), and within ~30 s the instance takes
+the approved / refused branch, closes the task and completes. Start API: `POST /api/flow/start/{ns}/{name}?version=`
+(Admin / Manager, body = workflow input).
+
 ## examples: explore:* (learning workflows, read-only)
 
 In `examples/workflows/`, not loaded by default: copy one into `workflows/` to run it. The 1.0.0 runner had no API

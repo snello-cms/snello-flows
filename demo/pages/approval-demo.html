@@ -1,0 +1,37 @@
+<!-- Workflow page "approval-demo" (snello workflowpages row, served at /p/approval-demo?task=<uuid>).
+     Shows the request of a demo:approval task and the decision bar (APPROVE / REFUSE, comment, UNDO).
+     Everything here runs in the reviewer's browser; snello checks login, roles and the task status. -->
+<div class="sp-wrap">
+  <h1 class="sp-h1" id="title">Loading…</h1>
+  <div class="sp-card">
+    <table class="sp-table">
+      <tr><td>Request</td><td id="req-title"></td></tr>
+      <tr><td>Details</td><td id="req-details"></td></tr>
+      <tr><td>Requested by</td><td id="req-requester"></td></tr>
+      <tr><td>Created</td><td id="req-created"></td></tr>
+    </table>
+  </div>
+  <div class="sp-card sp-small" id="flow"></div>
+  <!-- status, comment, APPROVE / REFUSE, UNDO -->
+  <div id="decisions"></div>
+  <div class="sp-card sp-small sp-muted">
+    After a decision the workflow waits 15 s before it acts on it: UNDO works until then.
+    It checks every 10 s, so the page shows the outcome within about half a minute.
+  </div>
+</div>
+<script>
+  const text = (id, v) => { document.getElementById(id).textContent = v || '-'; };
+  snello.onChange(({task, workflow}) => {
+    let data = {};
+    try { data = typeof task.data === 'string' ? JSON.parse(task.data) : (task.data || {}); } catch (e) { console.warn('[approval-demo] task.data is not JSON', e); }
+    document.getElementById('title').textContent = task.title;
+    text('req-title', data.title);
+    text('req-details', data.details || task.description);
+    text('req-requester', data.requester);
+    text('req-created', task.created_at ? new Date(task.created_at).toLocaleString() : '');
+    document.getElementById('flow').innerHTML = 'Workflow <b>' + snello.esc(task.workflow_namespace + ':' + task.workflow_name) + '</b>'
+      + (workflow ? ' — ' + snello.esc(workflow.status || '') + (workflow.currentTask ? ', now at <b>' + snello.esc(workflow.currentTask) + '</b>' : '') : '')
+      + (task.status === 'CLOSED' ? ' — <b>done</b>' : '');
+  });
+  snello.renderDecisions(document.getElementById('decisions'));
+</script>
