@@ -18,6 +18,7 @@ Workflow deploy (snello admin "Workflows"; the runner 1.3.0 has no deploy API, i
   GET    /workflows                                   files deployed through the bridge (ui-*.yaml)
   PUT    /workflows/{namespace}/{name}/{version}      body = workflow YAML; header X-Bridge-Token
   DELETE /workflows/{namespace}/{name}/{version}      header X-Bridge-Token
+  POST   /workflows/{namespace}/{name}/{version}/adopt[?dry=1]   header X-Bridge-Token; body = YAML (optional)
 
 PUT writes WORKFLOWS_DIR/ui-{namespace}-{name}-{version}.yaml and waits until the runner has registered it (its file
 watcher polls every 5 s). The runner only validates the file and logs a WARN, so its watcher log
@@ -25,12 +26,18 @@ watcher polls every 5 s). The runner only validates the file and logs a WARN, so
 would be retried and warned about every 5 s forever) and the runner's message is returned (422 / 504).
 Versions are immutable: the runner never reloads an edited file, so an already loaded namespace:name:version is 409.
 DELETE only removes the file: the runner keeps a loaded workflow until it restarts.
+adopt = "import into the snello editor" of a workflow the runner already runs from another file (git-managed copy):
+?dry=1 answers that file's text ({yaml, source}) without writing; without dry the body (or else that file) is written
+as the ui-*.yaml of the same namespace:name:version. The runner skips it ("already registered", one WARN) and loads
+it from that file at its next start, so running instances keep their version. ADOPT_REMOVE_SOURCE=true also deletes
+the source file(s), so only the ui-*.yaml is left (the k8s PVC; off locally, where the folder is the git checkout).
 Writes are off unless WORKFLOWS_DIR and BRIDGE_WRITE_TOKEN are both set.
 
 Env: FLOW_EVENTS_FILE (/deployments/data/flow-events.log), BRIDGE_HOST (0.0.0.0), BRIDGE_PORT (8091),
      BRIDGE_MAX_INSTANCES (5000), BRIDGE_POLL_SECONDS (0.5),
      WORKFLOWS_DIR (unset), BRIDGE_WRITE_TOKEN (unset), RUNNER_URL (http://127.0.0.1:8090),
-     FLOW_WATCHER_LOG (/deployments/data/flow-watcher.log), DEPLOY_TIMEOUT_SECONDS (20), MAX_WORKFLOW_BYTES (262144)
+     FLOW_WATCHER_LOG (/deployments/data/flow-watcher.log), DEPLOY_TIMEOUT_SECONDS (20), MAX_WORKFLOW_BYTES (262144),
+     ADOPT_REMOVE_SOURCE (false)
 Standard library only: runs on any python:3 image, the script is mounted from a ConfigMap.
 """
 import hmac
@@ -62,6 +69,7 @@ MAX_WORKFLOW_BYTES = int(os.environ.get("MAX_WORKFLOW_BYTES", str(256 * 1024)))
 DSL_NAME = re.compile(r"^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$")
 VERSION = re.compile(r"^[A-Za-z0-9.+-]{1,50}$")
 UI_PREFIX = "ui-"
+ADOPT_REMOVE_SOURCE = os.environ.get("ADOPT_REMOVE_SOURCE", "false").strip().lower() in ("1", "true", "yes")
 deploy_lock = threading.Lock()   # one deploy at a time: each one reads "its" lines of the watcher log
 
 logging.basicConfig(level=os.environ.get("BRIDGE_LOG_LEVEL", "INFO"),
@@ -218,9 +226,9 @@ def summary(r):
 # ---- workflow deploy -------------------------------------------------------------------------------------------
 
 class DeployError(Exception):
-    def __init__(self, status, message):
+    def __init__(self, status, message, code=None):
         super().__init__(message)
-        self.status, self.message = status, message
+        self.status, self.message, self.code = status, message, code
 
 
 def writes_enabled():
@@ -325,6 +333,64 @@ def deploy(ns, name, version, body):
                                "(does document.namespace/name/version in the YAML match? see the runner log)")
 
 
+def source_files(ns, name, version):
+    """Non ui-* workflow files of WORKFLOWS_DIR (top folder) whose document block is namespace:name:version."""
+    want = {"namespace": ns, "name": name, "version": version}
+    out = []
+    if not WORKFLOWS_DIR or not os.path.isdir(WORKFLOWS_DIR):
+        return out
+    for f in sorted(os.listdir(WORKFLOWS_DIR)):
+        path = os.path.join(WORKFLOWS_DIR, f)
+        if f.startswith(UI_PREFIX) or f.startswith(".") or not f.endswith((".yaml", ".yml")) or not os.path.isfile(path):
+            continue
+        try:
+            with open(path, "rb") as fh:
+                body = fh.read(MAX_WORKFLOW_BYTES + 1)
+        except OSError as e:
+            log.warning("adopt: cannot read %s: %s", path, e)
+            continue
+        if len(body) <= MAX_WORKFLOW_BYTES and document_ids(body) == want:
+            out.append((f, body))
+    return out
+
+
+def adopt(ns, name, version, body, dry):
+    """Import of a workflow the runner already runs from another file; see the module doc."""
+    if not runner_has(ns, name, version):
+        log.info("adopt %s:%s:%s: not loaded by the runner", ns, name, version)
+        raise DeployError(404, f"{ns}:{name}:{version} is not loaded by the runner")
+    sources = source_files(ns, name, version)
+    log.info("adopt %s:%s:%s: dry=%s body=%d bytes, source files %s", ns, name, version, dry, len(body or b""),
+             [f for f, _ in sources] or "-")
+    if not body:
+        if not sources:
+            raise DeployError(404, f"no workflow file for {ns}:{name}:{version} in the workflows folder "
+                                   "(send the YAML in the body)", "no-source")
+        body = sources[0][1]
+    if dry:
+        return {"namespace": ns, "name": name, "version": version, "source": sources[0][0] if sources else None,
+                "yaml": body.decode("utf-8", errors="replace")}
+    ids = document_ids(body)
+    if ids != {"namespace": ns, "name": name, "version": version}:
+        log.warning("adopt %s:%s:%s refused: document block says %s", ns, name, version, ids)
+        raise DeployError(400, f"the YAML's document namespace/name/version {ids} does not match {ns}:{name}:{version}")
+    path = ui_file(ns, name, version)
+    with deploy_lock:
+        tmp = os.path.join(WORKFLOWS_DIR, f".{os.path.basename(path)}.tmp")
+        with open(tmp, "wb") as fh:
+            fh.write(body)
+        os.replace(tmp, path)
+        removed = []
+        if ADOPT_REMOVE_SOURCE:
+            for f, _ in sources:
+                remove_quietly(os.path.join(WORKFLOWS_DIR, f))
+                removed.append(f)
+    log.info("adopt %s:%s:%s: wrote %s (%d bytes), removed sources %s", ns, name, version, path, len(body),
+             removed or "none (ADOPT_REMOVE_SOURCE off)")
+    return {"namespace": ns, "name": name, "version": version, "file": os.path.basename(path),
+            "source": sources[0][0] if sources else None, "removed": removed}
+
+
 def remove_quietly(path):
     try:
         os.remove(path)
@@ -386,10 +452,15 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json(200, body) if body else self.send_json(404, {"error": "unknown instance"})
         return self.send_json(404, {"error": "not found"})
 
-    def workflow_target(self, method):
-        """(ns, name, version) of /workflows/{ns}/{name}/{version} once writes, token and names are checked;
-        None after an error answer has been sent."""
+    def workflow_target(self, method, suffix=None):
+        """(ns, name, version) of /workflows/{ns}/{name}/{version}[/{suffix}] once writes, token and names are
+        checked; None after an error answer has been sent."""
         parts = [urllib.parse.unquote(p) for p in urllib.parse.urlparse(self.path).path.split("/") if p]
+        if suffix:
+            if len(parts) != 5 or parts[4] != suffix:
+                self.send_json(404, {"error": "not found"})
+                return None
+            parts = parts[:4]
         if len(parts) != 4 or parts[0] != "workflows":
             self.send_json(404, {"error": "not found"})
             return None
@@ -402,7 +473,7 @@ class Handler(BaseHTTPRequestHandler):
             log.warning("%s %s: bad or missing X-Bridge-Token from %s", method, self.path, self.address_string())
             self.send_json(401, {"error": "bad token"})
             return None
-        ns, name, version = parts[1:]
+        ns, name, version = parts[1:4]
         if not (DSL_NAME.match(ns) and DSL_NAME.match(name) and VERSION.match(version)):
             log.warning("%s %s: invalid namespace/name/version", method, self.path)
             self.send_json(400, {"error": "namespace and name: letters, digits and '-' (not first/last), max 63; "
@@ -425,6 +496,27 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json(e.status, {"error": e.message})
         except OSError as e:
             log.exception("PUT /workflows/%s: write failed", ":".join(target))
+            return self.send_json(500, {"error": f"cannot write the workflow file: {e}"})
+
+    def do_POST(self):
+        target = self.workflow_target("POST", "adopt")
+        if not target:
+            return
+        q = {k: v[0] for k, v in urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).items()}
+        dry = q.get("dry") in ("1", "true")
+        length = int(self.headers.get("Content-Length") or 0)
+        if length > MAX_WORKFLOW_BYTES:
+            return self.send_json(413, {"error": f"body: at most {MAX_WORKFLOW_BYTES} bytes of YAML"})
+        body = self.rfile.read(length) if length else b""
+        if body.strip() in (b"", b"{}"):
+            body = b""  # snello's empty POST body: take the source file
+        log.info("POST /workflows/%s/adopt dry=%s: %d bytes", ":".join(target), dry, len(body))
+        try:
+            return self.send_json(200, adopt(*target, body, dry))
+        except DeployError as e:
+            return self.send_json(e.status, {"error": e.message, **({"code": e.code} if e.code else {})})
+        except OSError as e:
+            log.exception("POST /workflows/%s/adopt: write failed", ":".join(target))
             return self.send_json(500, {"error": f"cannot write the workflow file: {e}"})
 
     def do_DELETE(self):

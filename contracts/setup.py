@@ -115,8 +115,12 @@ METADATA = [
       "description": "One contract-evaluation run per rent contract (uuid = rent contract uuid)",
       "icon": "fa fa-diagram-project", "table_key": "uuid", "table_key_type": "uuid", "metadata_group": "data",
       "api_protected": True, "username_field": "created_by", "order_by": "start_date desc",
-      "select_fields": "uuid,workflow_instance_uuid,start_date,end_date,final_status,decision"},
+      "select_fields": "uuid,workflow_instance_uuid,workflow_version,start_date,end_date,final_status,decision"},
      [f("workflow_instance_uuid", "input", "Workflow instance", input_type="text", show_in_list=True),
+      # contracts:contract-evaluation version this contract runs (the action starts it without a version: the runner
+      # takes its highest). Written by rent-contracts-post-persist; empty = the runner did not say.
+      f("workflow_version", "input", "Workflow version (automatic)", input_type="text", input_disabled=True,
+        show_in_list=True),
       # the review page link the workflow emailed; an <a> tag, because the admin renders HTML (clickable) only
       # for rich-text fields. Written by the workflow (task storeReviewUrl).
       f("review_url", "tinymce", "Review page (link)", input_disabled=True),

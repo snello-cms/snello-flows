@@ -3,7 +3,8 @@
 //    (one phase per table+condition: no PRE PERSIST possible)
 // 2. renders the contract PDF (print template rent_contract) and mails it to the applicant: "we will evaluate"
 // 3. starts the Quarkus Flow workflow contracts:contract-evaluation with the contract + the ID card link
-// 4. creates the rent_contracts_workflow_instances row (uuid = contract uuid) holding the flow instance id
+// 4. creates the rent_contracts_workflow_instances row (uuid = contract uuid) holding the flow instance id and the
+//    workflow version the runner chose
 // Env: SNELLO_FLOW_URL (runner, default http://127.0.0.1:8090), SNELLO_PUBLIC_URL (links, default http://localhost:8080).
 // snello needs snello.http.allow-private=true (+ snello.http.allowed-hosts=<runner host>) to reach the runner.
 var env = java.lang.System.getenv();
@@ -58,10 +59,31 @@ if (!r.ok()) {
 var instanceId = String(r.result().instanceId);
 log.infof('rent contract %s: flow instance %s (%s)', uuid, instanceId, r.result().status);
 
+// which version the runner chose (started without one: it takes its highest). The start answer does not say; the
+// runner's active instances do (the instance waits for the review, so it is there). Not found = left empty.
+var version = null;
+var active = call(GET, FLOW + '/q/flow/instances');
+if (active.ok() && active.result() && active.result().instances) {
+    var list = active.result().instances;
+    for (var i = 0; i < list.length; i++) {
+        if (String(list[i].instanceId) === instanceId) {
+            version = String(list[i].workflowVersion);
+            break;
+        }
+    }
+}
+if (version) {
+    log.infof('rent contract %s: flow instance %s runs contracts:contract-evaluation:%s', uuid, instanceId, version);
+} else {
+    log.warnf('rent contract %s: version of flow instance %s not found (runner instances status=%s): workflow_version left empty',
+        uuid, instanceId, active.status());
+}
+
 // 4. the instance row the review page and the workflow share (decision / final_status)
 var row = new java.util.HashMap();
 row.put('uuid', uuid);
 row.put('workflow_instance_uuid', instanceId);
+row.put('workflow_version', version);
 row.put('start_date', java.sql.Timestamp.from(java.time.Instant.now()));
 db.create('rent_contracts_workflow_instances', 'uuid', row);
-log.infof('rent contract %s: rent_contracts_workflow_instances row created for instance %s', uuid, instanceId);
+log.infof('rent contract %s: rent_contracts_workflow_instances row created for instance %s (version %s)', uuid, instanceId, version);
